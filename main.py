@@ -185,12 +185,8 @@ ADMIN_IDS = _env_list_of_ints('BOT_ADMIN_IDS')
 # protected from removal, while admins added later remain removable.
 _HARDCODED_ROOT_ADMIN_IDS = frozenset(ADMIN_IDS)
 
-# --- FAMGATEWAY API CONFIGURATION ---
-FAM_API_KEY = os.getenv('FAMPAY_API_KEY', '').strip()
-# Official FamGateway endpoint. FAMPAY_GATEWAY_URL can still override this for
-# an explicitly configured compatible/legacy gateway.
-BASE_GATEWAY_URL = os.getenv('FAMPAY_GATEWAY_URL', 'https://fampaygateway.site').strip()
-RECEIVER_UPI = os.getenv('FAMPAY_UPI_ID', '').strip()
+# --- PAYMENT GATEWAY: configured from the admin panel (UPI ID + API token) ---
+# See the "UNIFIED PAYMENT GATEWAY" section below. No environment variables needed.
 
 
 # --- SAFE TELEGRAM LONG MESSAGE SENDER (ADDED PATCH) ---
@@ -1085,12 +1081,9 @@ except Exception:
 # Dynamic Guide Link Variable
 guide_video_url = None
 
-# ==================== OPTIONAL PAYTM GATEWAY ====================
-PAYTM_PRODUCTION_BASE='https://secure.paytmpayments.com'
-PAYTM_QR_CREATE_URL=PAYTM_PRODUCTION_BASE+'/paymentservices/qr/create'
-PAYTM_STATUS_URL=PAYTM_PRODUCTION_BASE+'/v3/order/status'
-PAYTM_DEFAULT_CLIENT_ID=os.getenv('PAYTM_CLIENT_ID','C11')
-PAYTM_DEFAULT_POS_ID=os.getenv('PAYTM_POS_ID','')
+# ==================== UNIFIED PAYMENT GATEWAY SETTINGS ====================
+PG_BASE_URL = os.getenv('PAYMENT_GATEWAY_BASE_URL', 'https://paymentgateway-0aak.onrender.com').strip().rstrip('/')
+PG_KEY_MARKER = 'PGW'  # stored in payment_gateways.merchant_id for gateways saved on the unified system
 
 # ==================== DATABASE SETUP ====================
 def init_db():
@@ -1201,13 +1194,14 @@ def init_db():
             cursor.execute('INSERT OR IGNORE INTO bot_admins(user_id,added_at) VALUES(?,?)',(int(_aid),datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     except Exception: pass
     cursor.execute("CREATE TABLE IF NOT EXISTS payment_gateways (gateway TEXT PRIMARY KEY, upi_id TEXT NOT NULL DEFAULT '', merchant_id TEXT NOT NULL DEFAULT '', merchant_key TEXT NOT NULL DEFAULT '', connected INTEGER NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '')")
-    cursor.execute('INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,1,?)',('fam',RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY,datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    cursor.execute("UPDATE payment_gateways SET upi_id=?,merchant_id=?,merchant_key=? WHERE gateway='fam' AND (upi_id='' OR merchant_id='')",(RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY))
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','fam')")
-    cursor.execute("INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)",('paytm','','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_pos_id','')")
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_client_id',?)",(PAYTM_DEFAULT_CLIENT_ID,))
-    cursor.execute("UPDATE settings SET value='fam' WHERE key='active_payment_gateway'")
+    for _pg_name in ('fam', 'paytm'):
+        cursor.execute('INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)',(_pg_name,'','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','')")
+    # Migration: credentials saved for the old separate FamPay/PayTM/ZYVO systems
+    # do not work with the unified gateway. Mark them disconnected so the admin
+    # re-enters UPI ID + API token once.
+    cursor.execute('UPDATE payment_gateways SET connected=0 WHERE merchant_id!=?',(PG_KEY_MARKER,))
+    cursor.execute("UPDATE settings SET value='' WHERE key='active_payment_gateway' AND value NOT IN (SELECT gateway FROM payment_gateways WHERE connected=1)")
     # Admin-controlled runtime settings. Defaults preserve the bot's current behavior.
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('bot_enabled','1')")
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('telegram_support_id',?)",(TELEGRAM_USER,))
@@ -1858,472 +1852,323 @@ def _gateway_status_line(gateway):
 
 
 
-def _fam_gateway_base_candidates():
-    """Return compatible FamGateway base URLs without duplicating /api."""
-    raw = str(BASE_GATEWAY_URL or '').strip().rstrip('/')
-    if not raw:
-        raw = 'https://famgateway.in/api'
-    candidates = [raw]
-    if raw.lower().endswith('/api'):
-        candidates.append(raw[:-4].rstrip('/'))
-    elif raw.lower().endswith('/api/'):
-        candidates.append(raw[:-5].rstrip('/'))
-    return list(dict.fromkeys(candidates))
+# ==================== UNIFIED PAYMENT GATEWAY (FamPay + PayTM) ====================
+# One website (PG_BASE_URL) serves both gateways. The bot sends the same API
+# token for either one and selects the provider with the "gateway" field:
+#     'fam'   -> "fampay"   |   'paytm' -> "paytm"
+# Admin setup per gateway: UPI ID + API token. The UPI ID is saved for the admin
+# panel; the receiving UPI itself is configured on the gateway website
+# ("Gateways" page) and is not sent in API calls.
+PG_API_NAME = {'fam': 'fampay', 'paytm': 'paytm'}
+PG_LABEL = {'fam': 'FamPay', 'paytm': 'PayTM'}
+PG_ORDER_META = {}
+PG_LAST_CHECK = {}
+_PG_RATE_LOCK = threading.Lock()
+_PG_RATE_HITS = {}
+_PG_COOLDOWN_UNTIL = {}
 
 
-def _fam_endpoint_candidates(base, endpoint):
-    base = str(base or '').rstrip('/')
-    endpoint = str(endpoint or '').lstrip('/')
-    urls = [f'{base}/{endpoint}']
-    if not base.lower().endswith('/api'):
-        urls.append(f'{base}/api/{endpoint}')
-    return list(dict.fromkeys(urls))
+class PaymentGatewayError(RuntimeError):
+    def __init__(self, status_code, message):
+        self.status_code = int(status_code or 0)
+        self.message = str(message or '')
+        super().__init__(self.message or ('Gateway error (HTTP %s)' % self.status_code))
 
 
-def _legacy_check_fam_connection():
-    row = _gateway_row('fam')
-    if not row or not row[1] or not row[2]:
-        return False, 'FAMP UPI ID and API token are required.'
-    key = str(row[2] or row[3] or FAM_API_KEY).strip()
-    if not key:
-        _set_gateway_connected('fam', False)
-        return False, 'FAMP API token is missing.'
-
-    # A verification request for a deliberately non-existent order is enough to
-    # validate authentication without creating/charging a real payment order.
-    dummy = 'CONNECTION_TEST_' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '_' + secrets.token_hex(3)
-    last_detail = 'No response from gateway.'
-    auth_seen = False
-    try:
-        for base in _fam_gateway_base_candidates():
-            for endpoint in ('verify-order.php', 'verify.php'):
-                for url in _fam_endpoint_candidates(base, endpoint):
-                    try:
-                        res = HTTP_SESSION.get(
-                            url,
-                            params={'order_id': dummy, 'api_key': key},
-                            timeout=8,
-                        )
-                        last_detail = f'HTTP {res.status_code}'
-                        try:
-                            data = res.json()
-                        except Exception:
-                            data = {}
-                        status = str(data.get('status') or '').lower() if isinstance(data, dict) else ''
-                        message = str(data.get('message') or status or last_detail)[:300]
-                        last_detail = message
-
-                        if res.status_code in (401, 403):
-                            _set_gateway_connected('fam', False)
-                            return False, message or 'Invalid or unauthorized API token.'
-
-                        # Official FamGateway returns 404 for a non-existent
-                        # order. That is an authenticated response and therefore
-                        # proves the API key is accepted without creating an order.
-                        if res.status_code == 404:
-                            text = json.dumps(data, ensure_ascii=False).lower() if isinstance(data, dict) else ''
-                            if any(x in text for x in ('not_found', 'order_id', 'order not', 'does not exist')):
-                                auth_seen = True
-                                continue
-
-                        if 200 <= res.status_code < 300:
-                            auth_seen = True
-                            if status in {'success', 'pending', 'expired', 'not_found', 'error'} or isinstance(data, dict):
-                                continue
-
-                        if res.status_code >= 500:
-                            continue
-                    except requests.RequestException as exc:
-                        last_detail = str(exc)[:300]
-                        continue
-
-        if auth_seen:
-            _set_gateway_connected('fam', True)
-            return True, 'API token verified successfully.'
-
-        _set_gateway_connected('fam', False)
-        return False, last_detail
-    except Exception as e:
-        _set_gateway_connected('fam', False)
-        return False, str(e)[:300]
-
-def _paytm_json_compact(value):
-    # Paytm's published Python examples sign json.dumps(body) and then send the
-    # same JSON object. Keep the standard JSON spacing/order used by that flow.
-    return json.dumps(value, ensure_ascii=False)
-
-def _paytm_checksum_generate(body_string, merchant_key):
-    """Generate the official Paytm checksum without requiring a separate package.
-
-    Paytm's published checksum flow uses SHA-256(body|salt)+salt and encrypts
-    the result with AES-128-CBC using the fixed Paytm IV.
-    """
-    if not _PAYTM_CRYPTO_AVAILABLE:
-        raise RuntimeError(
-            'Paytm crypto dependency is missing. Add cryptography to requirements.txt '
-            'and restart the bot.'
-        )
-    key = str(merchant_key or '').strip()
-    if len(key.encode('utf-8')) != 16:
-        raise RuntimeError('Paytm Merchant Key must be a 16-byte production Merchant Key.')
-    salt = ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789') for _ in range(4))
-    digest = hashlib.sha256((str(body_string) + '|' + salt).encode('utf-8')).hexdigest() + salt
-    padder = _crypto_padding.PKCS7(128).padder()
-    padded = padder.update(digest.encode('utf-8')) + padder.finalize()
-    cipher = _CryptoCipher(
-        _crypto_algorithms.AES(key.encode('utf-8')),
-        _crypto_modes.CBC(b'@@@@&&&&####$$$$')
-    )
-    encryptor = cipher.encryptor()
-    encrypted = encryptor.update(padded) + encryptor.finalize()
-    return __import__('base64').b64encode(encrypted).decode('ascii')
-
-def _paytm_checksum_verify(body_string, merchant_key, checksum):
-    """Verify a Paytm response signature when one is returned."""
-    if not _PAYTM_CRYPTO_AVAILABLE:
-        return False
-    key = str(merchant_key or '').strip()
-    if len(key.encode('utf-8')) != 16 or not checksum:
-        return False
-    try:
-        raw = __import__('base64').b64decode(str(checksum))
-        cipher = _CryptoCipher(
-            _crypto_algorithms.AES(key.encode('utf-8')),
-            _crypto_modes.CBC(b'@@@@&&&&####$$$$')
-        )
-        decryptor = cipher.decryptor()
-        padded = decryptor.update(raw) + decryptor.finalize()
-        unpadder = _crypto_padding.PKCS7(128).unpadder()
-        decoded = unpadder.update(padded) + unpadder.finalize()
-        decoded_text = decoded.decode('utf-8')
-        salt = decoded_text[-4:]
-        expected = hashlib.sha256((str(body_string) + '|' + salt).encode('utf-8')).hexdigest() + salt
-        return decoded_text == expected
-    except Exception:
-        return False
-
-def _paytm_config():
-    row = _gateway_row('paytm')
+def _pg_config(gateway):
+    row = _gateway_row(gateway)
     return {
         'upi_id': str(row[1]).strip() if row and row[1] else '',
-        'mid': str(row[2]).strip() if row and row[2] else '',
-        'merchant_key': str(row[3]).strip() if row and row[3] else '',
+        'api_key': str(row[3]).strip() if row and row[3] else '',
         'connected': bool(int(row[4] or 0)) if row else False,
-        'client_id': str(get_setting('paytm_client_id') or PAYTM_DEFAULT_CLIENT_ID).strip(),
-        'pos_id': str(get_setting('paytm_pos_id') or PAYTM_DEFAULT_POS_ID).strip(),
     }
 
-def _paytm_payment_config_error():
-    cfg = _zyvopay_config() if '_zyvopay_config' in globals() else {'upi_id':'','api_key':''}
-    if not cfg.get('upi_id'):
+
+def _pg_config_error(gateway):
+    cfg = _pg_config(gateway)
+    if not cfg['upi_id']:
         return 'UPI ID is required.'
-    try:
-        _zyvopay_signing_key(cfg.get('api_key',''))
-    except Exception:
-        return 'A complete ZYVO PAY public.secret API token is required.'
+    if not cfg['api_key']:
+        return 'API token is required.'
     return ''
 
-# PayTM-labelled admin tile now connects to ZYVO PAY (merchant dashboard API).
-ZYVOPAY_BASE_URL = os.getenv('ZYVOPAY_BASE_URL', 'https://zyvopay.site/api').strip().rstrip('/')
-ZYVOPAY_ORDER_META = {}
 
-def _zyvopay_config(gateway='paytm'):
-    row = _gateway_row(gateway)
-    api_key = ''
-    if row:
-        api_key = str(row[3]).strip() if row[3] else (str(row[2]).strip() if gateway == 'fam' and row[2] else '')
-    return {
-        'upi_id': str(row[1]).strip() if row and row[1] else '',
-        'api_key': api_key,
-        'connected': bool(int(row[4] or 0)) if row else False,
-    }
+def _pg_rate_try(api_key, limit):
+    """The gateway allows 60 requests/minute per key. Stay under it locally."""
+    now = time.time()
+    with _PG_RATE_LOCK:
+        if now < _PG_COOLDOWN_UNTIL.get(api_key, 0):
+            return False
+        hits = _PG_RATE_HITS.setdefault(api_key, [])
+        while hits and now - hits[0] > 60:
+            hits.pop(0)
+        if len(hits) >= limit:
+            return False
+        hits.append(now)
+        return True
 
-def _zyvopay_signing_key(api_key):
-    # Dashboard token is public.secret. Split only at the first period.
-    if not isinstance(api_key, str) or '.' not in api_key:
-        raise RuntimeError('Invalid ZYVO PAY API token. Paste the complete public.secret token from the dashboard.')
-    public, secret = api_key.split('.', 1)
-    if not public or not secret:
-        raise RuntimeError('Invalid ZYVO PAY API token format.')
-    return secret
 
-def _zyvopay_request(method, endpoint, payload=None, retries=2, gateway='paytm'):
-    cfg = _zyvopay_config(gateway)
+def _pg_request(method, path, gateway, payload=None, retries=1, rate_limit=58):
+    cfg = _pg_config(gateway)
     api_key = cfg['api_key']
-    secret = _zyvopay_signing_key(api_key)
-    body = '' if method.upper() == 'GET' else json.dumps(payload or {}, ensure_ascii=False, separators=(',', ':'))
-    timestamp = str(int(time.time()))
-    signature = hmac.new(secret.encode('utf-8'), (timestamp + '.' + body).encode('utf-8'), hashlib.sha256).hexdigest()
-    headers = {'Content-Type':'application/json','X-API-Key':api_key,'X-Timestamp':timestamp,'X-Signature':signature}
-    url = ZYVOPAY_BASE_URL + '/' + endpoint.lstrip('/')
-    last_error = 'ZYVO PAY request failed.'
+    if not api_key:
+        raise PaymentGatewayError(0, 'API token is not saved.')
+    url = PG_BASE_URL + path
+    headers = {'X-API-Key': api_key}
+    if method.upper() != 'GET':
+        headers['Content-Type'] = 'application/json'
+    last = PaymentGatewayError(0, 'Could not reach the payment gateway. Please try again.')
     for attempt in range(max(0, int(retries)) + 1):
+        if not _pg_rate_try(api_key, rate_limit):
+            raise PaymentGatewayError(429, 'Gateway is busy. Please try again in a few seconds.')
         try:
-            response = HTTP_SESSION.request(method.upper(), url, data=(body if method.upper() != 'GET' else None), headers=headers, timeout=(5, 18))
-            try: data = response.json()
-            except Exception: data = {}
-            if response.status_code < 400 and isinstance(data, dict):
-                return data
-            # Only retry server errors / throttling; never retry auth or validation errors.
-            message = data.get('message') if isinstance(data, dict) else None
-            last_error = 'ZYVO PAY API error (HTTP %s)%s' % (response.status_code, ': ' + str(message)[:180] if message else '')
-            if response.status_code < 500 and response.status_code != 429:
-                break
-            if attempt >= retries: break
-            time.sleep(0.4 * (attempt + 1))
+            # Generous read timeout: the gateway host can be slow on a cold start.
+            resp = HTTP_SESSION.request(
+                method.upper(), url, headers=headers,
+                json=(payload if method.upper() != 'GET' else None),
+                timeout=(8, 30),
+            )
         except requests.RequestException:
-            last_error = 'Could not reach ZYVO PAY. Please try again.'
-            if attempt >= retries: break
-            time.sleep(0.4 * (attempt + 1))
-    raise RuntimeError(last_error)
-
-def _check_paytm_connection():
-    cfg = _zyvopay_config()
-    if not cfg['upi_id']:
-        _set_gateway_connected('paytm', False)
-        return False, 'Enter your UPI ID first.'
-    try:
-        _zyvopay_signing_key(cfg['api_key'])
-        # A harmless signed status lookup validates auth without creating a charge.
+            last = PaymentGatewayError(0, 'Could not reach the payment gateway. Please try again.')
+            if attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            raise last
         try:
-            _zyvopay_request('POST', 'check-payment.php', {'reference':'CONNECTION_TEST_' + secrets.token_hex(8)}, retries=0)
-            ok, detail = True, 'ZYVO PAY API token accepted.'
-        except RuntimeError as exc:
-            msg = str(exc)
-            # A not-found response is expected for a deliberately fake reference and proves auth.
-            ok = 'HTTP 404' in msg
-            detail = 'ZYVO PAY API token accepted.' if ok else msg
-        _set_gateway_connected('paytm', ok)
-        return ok, detail
+            data = resp.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if resp.status_code < 400:
+            return resp.status_code, data
+        message = str(data.get('error') or data.get('message') or '')[:200]
+        if resp.status_code == 429:
+            with _PG_RATE_LOCK:
+                _PG_COOLDOWN_UNTIL[api_key] = time.time() + 8
+        last = PaymentGatewayError(resp.status_code, message)
+        # Retry only provider outages (502/503/504); never auth/validation/limit errors.
+        if resp.status_code in (502, 503, 504) and attempt < retries:
+            time.sleep(0.8 * (attempt + 1))
+            continue
+        raise last
+    raise last
+
+
+def _check_pg_connection(gateway):
+    gateway = str(gateway).lower().strip()
+    label = PG_LABEL.get(gateway, gateway)
+    err = _pg_config_error(gateway)
+    if err:
+        _set_gateway_connected(gateway, False)
+        return False, err
+    try:
+        # A status lookup of a non-existent order proves the API token works
+        # without creating (or charging) a real payment.
+        _pg_request('GET', '/api/v1/payment/status/CONNECTION_TEST_' + secrets.token_hex(6), gateway, retries=1)
+        ok, detail = True, 'API token accepted.'
+    except PaymentGatewayError as exc:
+        if exc.status_code == 404:
+            ok, detail = True, 'API token accepted.'
+        elif exc.status_code == 401:
+            ok, detail = False, 'Invalid API token.'
+        elif exc.status_code == 403:
+            ok, detail = False, exc.message or 'Access denied (plan/account issue).'
+        else:
+            ok, detail = False, exc.message or 'Gateway check failed.'
     except Exception as exc:
-        _set_gateway_connected('paytm', False)
-        return False, str(exc)[:260]
+        ok, detail = False, str(exc)[:200]
+    _set_gateway_connected(gateway, ok)
+    if ok:
+        detail += (' Make sure %s is also set up in the gateway website\'s Gateways page '
+                   'with the same UPI ID, and that your plan includes it.' % label)
+    return ok, detail
 
-def _zyvopay_qr_image(payment):
-    payment_uri = payment.get('payment_uri')
-    if not isinstance(payment_uri, str):
-        raise RuntimeError('ZYVO PAY returned an invalid payment URI.')
-    if not payment_uri:
-        image_url = payment.get('qr_image_url') or ''
-        if image_url:
-            parsed = urllib.parse.urlparse(str(image_url))
-            if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password:
-                raise RuntimeError('ZYVO PAY returned an unsafe provider QR image URL.')
-            return str(image_url)  # provider QR must remain unchanged
-        checkout = str(payment.get('checkout_url') or '')
-        parsed = urllib.parse.urlparse(checkout)
-        if parsed.scheme == 'https' and parsed.netloc and not parsed.username and not parsed.password:
-            return None, checkout
-        raise RuntimeError('ZYVO PAY did not return a usable QR image or checkout URL.')
-    style = payment.get('qr_style') or {}
-    config = style.get('config') if isinstance(style, dict) else None
-    if not isinstance(config, dict):
-        raise RuntimeError('ZYVO PAY did not return its required QR style configuration.')
-    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=12, border=4)
-    qr.add_data(payment_uri)  # exact URI returned by provider; never reconstruct or edit
-    qr.make(fit=True)
-    color = str(config.get('color') or '#000000')
-    gradient = config.get('gradient')
-    try:
-        dots = str(config.get('dots') or 'square').lower()
-        drawer = RoundedModuleDrawer() if ('round' in dots or dots == 'dot') else SquareModuleDrawer()
-        img = qr.make_image(image_factory=StyledPilImage, module_drawer=drawer, color_mask=SolidFillColorMask(front_color=color, back_color=(255,255,255))).convert('RGB')
-    except Exception:
-        img = qr.make_image(fill_color='black', back_color='white').convert('RGB')
-    # Keep the merchant response's style scoped to this payment; gradient is applied as a local visual gradient.
-    if isinstance(gradient, list) and len(gradient) >= 2:
-        try:
-            from PIL import ImageColor
-            c1, c2 = ImageColor.getrgb(str(gradient[0])), ImageColor.getrgb(str(gradient[1]))
-            pix = img.load(); w,h=img.size
-            for x in range(w):
-                t=x/max(1,w-1); col=tuple(int(c1[i]*(1-t)+c2[i]*t) for i in range(3))
-                for y in range(h):
-                    if pix[x,y] != (255,255,255): pix[x,y]=col
-        except Exception: pass
-    center_text = str(config.get('center_text') or '')[:4]
-    if center_text:
-        draw=ImageDraw.Draw(img); w,h=img.size; box=max(44,int(w*0.16)); x0=(w-box)//2; y0=(h-box)//2
-        draw.rectangle((x0-5,y0-5,x0+box+5,y0+box+5),fill='white')
-        draw.rounded_rectangle((x0,y0,x0+box,y0+box),radius=8,fill=color if color.startswith('#') else '#000000')
-        try:
-            font=ImageFont.truetype('DejaVuSans-Bold.ttf', max(10,int(box*0.25)))
-        except Exception: font=ImageFont.load_default()
-        draw.text((w//2,h//2),center_text,fill='white',anchor='mm',font=font)
-    out=io.BytesIO(); out.name='zyvopay_qr.png'; img.save(out,format='PNG'); out.seek(0)
-    return out
-
-def _create_paytm_dynamic_qr(amount):
-    amount = round(float(amount), 2)
-    if not 1 <= amount <= 100000:
-        raise RuntimeError('Payment amount must be between ₹1 and ₹1,00,000.')
-    cfg = _zyvopay_config()
-    if not cfg['connected']:
-        raise RuntimeError('ZYVO PAY is not connected. Save the UPI ID and API token, then check connection.')
-    order_id = 'RG' + datetime.datetime.now().strftime('%y%m%d%H%M%S') + secrets.token_hex(5).upper()
-    payload = {'order_id':order_id,'amount':amount,'customer_name':BOT_BRAND_NAME[:100], 'description':str(BOT_BRAND_NAME)[:120], 'expires_in':10}
-    payment = _zyvopay_request('POST', 'create-payment.php', payload)
-    returned_order = str(payment.get('order_id') or order_id)
-    reference = str(payment.get('reference') or '')
-    try: returned_amount = round(float(payment.get('amount')), 2)
-    except (TypeError, ValueError): returned_amount = -1
-    if not reference or returned_order != order_id or returned_amount != amount or str(payment.get('currency') or 'INR').upper() != 'INR':
-        raise RuntimeError('ZYVO PAY returned payment details that did not match the requested order and amount.')
-    qr = _zyvopay_qr_image(payment)
-    ZYVOPAY_ORDER_META[returned_order] = {'amount':amount,'gateway':'paytm','reference':reference,'currency':'INR','payment_uri':payment.get('payment_uri') or '', 'expires_at':payment.get('expires_at'), 'created_at':time.time()}
-    # QR-only provider image URL is returned unchanged; checkout URL is used if no image exists.
-    if isinstance(qr, tuple):
-        return qr[1], returned_order
-    return qr, returned_order
-
-def _verify_paytm_order(order_id):
-    cfg = _zyvopay_config()
-    details = ZYVOPAY_ORDER_META.get(str(order_id)) or ZYVOPAY_ORDER_META.get(order_id) or active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
-    reference = str(details.get('reference') or '')
-    if not cfg['api_key'] or not reference:
-        return False, None, None
-    try:
-        result = _zyvopay_request('POST', 'check-payment.php', {'reference':reference}, retries=1)
-        if str(result.get('status') or '').lower() != 'successful': return False, None, None
-        if str(result.get('reference') or '') != reference or str(result.get('order_id') or '') != str(order_id): return False, None, None
-        if str(result.get('currency') or '').upper() != 'INR': return False, None, None
-        try:
-            if round(float(result.get('amount')),2) != round(float(details.get('amount')),2): return False, None, None
-        except (TypeError, ValueError): return False, None, None
-        return True, str(result.get('utr') or 'N/A'), 'ZYVO PAY/UPI'
-    except Exception:
-        return False, None, None
-
-# ==================== FAMPAY BUTTON -> ZYVO PAY ====================
-# The FamPay gateway tile now runs on ZYVO PAY. The admin only pastes the full
-# public.secret API token; the merchant UPI is managed inside ZYVO PAY, so the
-# bot stores the marker 'ZYVOPAY' in the gateway UPI column. Gateways saved
-# before this update (real UPI ID + old FamGateway key) keep using the old
-# FamGateway code until the admin re-enters a token via the FamPay button.
-def _fam_uses_zyvopay():
-    row = _gateway_row('fam')
-    return bool(row and str(row[1] or '').strip().upper() == 'ZYVOPAY')
-
-def _zyvopay_ref_init():
-    with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS zyvopay_order_refs (order_id TEXT PRIMARY KEY, gateway TEXT NOT NULL, reference TEXT NOT NULL, amount REAL NOT NULL, created_at TEXT NOT NULL)")
-        conn.commit()
-
-def _zyvopay_ref_save(order_id, gateway, reference, amount):
-    try:
-        _zyvopay_ref_init()
-        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-            conn.execute("INSERT OR REPLACE INTO zyvopay_order_refs(order_id,gateway,reference,amount,created_at) VALUES(?,?,?,?,?)",
-                         (str(order_id), str(gateway), str(reference), float(amount), datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-            conn.commit()
-    except Exception as exc:
-        print(f'[ZYVOPAY REF SAVE ERROR] {exc}')
-
-def _zyvopay_ref_get(order_id):
-    try:
-        _zyvopay_ref_init()
-        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-            row = conn.execute("SELECT reference,amount FROM zyvopay_order_refs WHERE order_id=?", (str(order_id),)).fetchone()
-        return (str(row[0]), float(row[1])) if row else (None, None)
-    except Exception:
-        return (None, None)
 
 def _check_fam_connection():
-    if not _fam_uses_zyvopay():
-        return _legacy_check_fam_connection()
-    cfg = _zyvopay_config('fam')
-    try:
-        _zyvopay_signing_key(cfg['api_key'])
-        try:
-            # Harmless signed lookup of a fake reference: proves auth without creating a charge.
-            _zyvopay_request('POST', 'check-payment.php', {'reference': 'CONNECTION_TEST_' + secrets.token_hex(8)}, retries=0, gateway='fam')
-            ok, detail = True, 'ZYVO PAY API token accepted.'
-        except RuntimeError as exc:
-            msg = str(exc)
-            ok = 'HTTP 404' in msg
-            detail = 'ZYVO PAY API token accepted.' if ok else msg
-        _set_gateway_connected('fam', ok)
-        return ok, detail
-    except Exception as exc:
-        _set_gateway_connected('fam', False)
-        return False, str(exc)[:260]
+    return _check_pg_connection('fam')
 
-def _create_fam_zyvopay_qr(amount):
+
+def _check_paytm_connection():
+    return _check_pg_connection('paytm')
+
+
+def _check_gateway_connection(gateway):
+    g = str(gateway).lower().strip()
+    if g in PG_API_NAME:
+        return _check_pg_connection(g)
+    return False, 'Unknown payment gateway.'
+
+
+def _paytm_payment_config_error():
+    return _pg_config_error('paytm')
+
+
+# ---- order bookkeeping (survives a bot restart) ----
+def _pg_orders_init():
+    with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS pg_orders (order_id TEXT PRIMARY KEY, gateway TEXT NOT NULL, pay_id TEXT NOT NULL DEFAULT '', amount REAL NOT NULL, pay_amount REAL NOT NULL, created_at TEXT NOT NULL)")
+        conn.commit()
+
+
+def _pg_order_save(order_id, gateway, pay_id, amount, pay_amount):
+    try:
+        _pg_orders_init()
+        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO pg_orders(order_id,gateway,pay_id,amount,pay_amount,created_at) VALUES(?,?,?,?,?,?)',
+                (str(order_id), str(gateway), str(pay_id or ''), float(amount), float(pay_amount),
+                 datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.commit()
+    except Exception as exc:
+        print(f'[PAYMENT GATEWAY ORDER SAVE ERROR] {exc}')
+
+
+def _pg_order_load(order_id):
+    meta = PG_ORDER_META.get(str(order_id))
+    if meta:
+        return meta
+    try:
+        _pg_orders_init()
+        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+            row = conn.execute('SELECT gateway,pay_id,amount,pay_amount FROM pg_orders WHERE order_id=?', (str(order_id),)).fetchone()
+        if row:
+            meta = {'gateway': row[0], 'pay_id': row[1], 'amount': float(row[2]), 'pay_amount': float(row[3])}
+            PG_ORDER_META[str(order_id)] = meta
+            return meta
+    except Exception:
+        pass
+    return None
+
+
+def _pg_pay_amount(order_id, fallback):
+    """Exact rupee amount the customer must pay (FamPay adds unique paise)."""
+    meta = _pg_order_load(order_id)
+    try:
+        return float(meta['pay_amount']) if meta else float(fallback)
+    except Exception:
+        return float(fallback)
+
+
+def _pg_amount_note(order_id, requested):
+    pay = _pg_pay_amount(order_id, requested)
+    if abs(pay - float(requested)) < 0.001:
+        return ''
+    return f"\n\n⚠️ <b>Pay exactly ₹{pay:.2f}</b> (unique paise = auto-verify)"
+
+
+def _create_pg_qr(gateway, amount):
+    gateway = str(gateway).lower().strip()
+    label = PG_LABEL.get(gateway, gateway)
+    api_name = PG_API_NAME[gateway]
     amount = round(float(amount), 2)
     if not 1 <= amount <= 100000:
         raise RuntimeError('Payment amount must be between ₹1 and ₹1,00,000.')
-    cfg = _zyvopay_config('fam')
+    cfg = _pg_config(gateway)
     if not cfg['connected']:
-        raise RuntimeError('FamPay (ZYVO PAY) is not connected. Save the API token, then check connection.')
+        raise RuntimeError(f'{label} is not connected. Save the UPI ID + API token, then check the connection.')
     order_id = 'RG' + datetime.datetime.now().strftime('%y%m%d%H%M%S') + secrets.token_hex(5).upper()
-    payload = {'order_id': order_id, 'amount': amount, 'customer_name': BOT_BRAND_NAME[:100], 'description': str(BOT_BRAND_NAME)[:120], 'expires_in': 10}
-    payment = _zyvopay_request('POST', 'create-payment.php', payload, gateway='fam')
-    returned_order = str(payment.get('order_id') or order_id)
-    reference = str(payment.get('reference') or '')
-    try: returned_amount = round(float(payment.get('amount')), 2)
-    except (TypeError, ValueError): returned_amount = -1
-    if not reference or returned_order != order_id or returned_amount != amount or str(payment.get('currency') or 'INR').upper() != 'INR':
-        raise RuntimeError('ZYVO PAY returned payment details that did not match the requested order and amount.')
-    qr = _zyvopay_qr_image(payment)
-    ZYVOPAY_ORDER_META[returned_order] = {'amount': amount, 'gateway': 'fam', 'reference': reference, 'currency': 'INR', 'payment_uri': payment.get('payment_uri') or '', 'expires_at': payment.get('expires_at'), 'created_at': time.time()}
-    _zyvopay_ref_save(returned_order, 'fam', reference, amount)  # survives a bot restart
-    if isinstance(qr, tuple):
-        return qr[1], returned_order
-    return qr, returned_order
-
-def _verify_fam_zyvopay_order(order_id):
-    cfg = _zyvopay_config('fam')
-    meta = ZYVOPAY_ORDER_META.get(str(order_id)) or {}
-    reference = str(meta.get('reference') or '')
-    expected = meta.get('amount')
-    if not reference:
-        reference, expected = _zyvopay_ref_get(order_id)
-    if not cfg['api_key'] or not reference or expected is None:
-        return False, None, None
+    payload = {
+        'amount': amount,
+        'order_id': order_id,
+        'gateway': api_name,
+        'customer': {'name': str(BOT_BRAND_NAME)[:100]},
+    }
     try:
-        result = _zyvopay_request('POST', 'check-payment.php', {'reference': reference}, retries=1, gateway='fam')
-        if str(result.get('status') or '').lower() != 'successful': return False, None, None
-        if str(result.get('reference') or '') != reference or str(result.get('order_id') or '') != str(order_id): return False, None, None
-        if str(result.get('currency') or '').upper() != 'INR': return False, None, None
+        _status, data = _pg_request('POST', '/api/v1/payment/create', gateway, payload, retries=1)
+    except PaymentGatewayError as exc:
+        raise RuntimeError(exc.message or f'{label} payment could not be created (HTTP {exc.status_code}).')
+    if data.get('success') is False:
+        raise RuntimeError(str(data.get('error') or f'{label} payment could not be created.')[:200])
+
+    returned_order = str(data.get('order_id') or '')
+    if returned_order != order_id:
+        raise RuntimeError('Gateway returned a different order id than requested.')
+    returned_gateway = str(data.get('gateway') or api_name).lower()
+    if returned_gateway != api_name:
+        raise RuntimeError('Gateway returned a different payment gateway than requested.')
+    if str(data.get('currency') or 'INR').upper() != 'INR':
+        raise RuntimeError('Gateway returned an unexpected currency.')
+    try:
+        pay_amount = round(float(data.get('amount')), 2)
+    except (TypeError, ValueError):
+        raise RuntimeError('Gateway did not return the payable amount.')
+    # FamPay may add +0.00..0.99 paise; anything else is a mismatch.
+    if pay_amount < amount - 0.001 or pay_amount > amount + 0.99 + 0.001:
+        raise RuntimeError('Gateway returned an amount that does not match the requested amount.')
+
+    pay_id = str(data.get('pay_id') or '')
+    PG_ORDER_META[order_id] = {'gateway': gateway, 'pay_id': pay_id, 'amount': amount,
+                               'pay_amount': pay_amount, 'created_at': time.time()}
+    _pg_order_save(order_id, gateway, pay_id, amount, pay_amount)
+
+    # Prefer the bot's own clean QR drawn from the gateway's UPI string; fall
+    # back to the gateway's hosted PNG.
+    upi_uri = str(data.get('upi_uri') or '').strip()
+    if upi_uri.lower().startswith('upi://'):
         try:
-            if round(float(result.get('amount')), 2) != round(float(expected), 2): return False, None, None
-        except (TypeError, ValueError): return False, None, None
-        return True, str(result.get('utr') or 'N/A'), 'ZYVO PAY/UPI'
+            return _build_stylish_qr_image(upi_uri), order_id
+        except Exception as exc:
+            print(f'[PAYMENT GATEWAY QR STYLE WARNING] {exc}')
+    qr_png = str(data.get('qr_png_url') or '').strip()
+    parsed = urllib.parse.urlparse(qr_png)
+    if parsed.scheme == 'https' and parsed.netloc and not parsed.username and not parsed.password:
+        return qr_png, order_id
+    raise RuntimeError('Gateway did not return a usable QR code.')
+
+
+def _verify_pg_order(gateway, order_id):
+    """Return (paid, utr, sender). Paid only when status == SUCCESS and the amount matches."""
+    meta = _pg_order_load(order_id)
+    if not meta:
+        return False, None, None
+    gateway = str(meta.get('gateway') or gateway).lower().strip()
+    if gateway not in PG_API_NAME:
+        return False, None, None
+    now = time.time()
+    if now - PG_LAST_CHECK.get(str(order_id), 0) < 3.5:   # docs: poll every 3-5 seconds
+        return False, None, None
+    PG_LAST_CHECK[str(order_id)] = now
+    if len(PG_LAST_CHECK) > 2000:
+        for k in [k for k, t in PG_LAST_CHECK.items() if now - t > 900]:
+            PG_LAST_CHECK.pop(k, None)
+    try:
+        _s, data = _pg_request('GET', '/api/v1/payment/status/' + urllib.parse.quote(str(order_id), safe=''),
+                               gateway, retries=0, rate_limit=45)
     except Exception:
         return False, None, None
+    body = data.get('data') if isinstance(data.get('data'), dict) else data
+    status = str(body.get('status') or data.get('status') or '').upper()
+    if status != 'SUCCESS':
+        return False, None, None
+    if body.get('order_id') and str(body.get('order_id')) != str(order_id):
+        return False, None, None
+    if body.get('gateway') and str(body.get('gateway')).lower() != PG_API_NAME[gateway]:
+        return False, None, None
+    if body.get('amount') is not None:
+        try:
+            if abs(float(body.get('amount')) - float(meta['pay_amount'])) > 0.005:
+                return False, None, None
+        except (TypeError, ValueError):
+            return False, None, None
+    utr = str(body.get('transaction_id') or body.get('utr') or 'N/A')
+    PG_LAST_CHECK.pop(str(order_id), None)
+    return True, utr, 'UPI User'
 
-def create_fam_qr(amount):
-    if _fam_uses_zyvopay():
-        return _create_fam_zyvopay_qr(amount)
-    return _legacy_create_fam_qr(amount)
-
-def verify_fam_order(order_id):
-    if _fam_uses_zyvopay():
-        return _verify_fam_zyvopay_order(order_id)
-    return _legacy_verify_fam_order(order_id)
-
-def _check_gateway_connection(gateway):
-    g=str(gateway).lower()
-    return _check_fam_connection() if g=='fam' else _check_paytm_connection() if g=='paytm' else (False,'Unknown payment gateway.')
 
 def _create_active_gateway_qr(amount):
-    gw=_get_active_payment_gateway()
-    if gw=='fam': return create_fam_qr(amount)
-    if gw=='paytm':
-        cfg=_paytm_config(); ready=_paytm_payment_config_error()
-        if not cfg['connected']: raise RuntimeError('PayTM is not connected. Check PayTM Connection first.')
-        if ready: raise RuntimeError('PayTM payment setup is incomplete: '+ready)
-        return _create_paytm_dynamic_qr(amount)
+    gw = _get_active_payment_gateway()
+    if gw in PG_API_NAME:
+        return _create_pg_qr(gw, amount)
     raise RuntimeError('No connected payment gateway is active.')
 
-def _verify_active_gateway_order(order_id,gateway=None):
-    details=active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
-    gw=str(gateway or details.get('gateway') or _get_active_payment_gateway()).lower()
-    if gw=='fam': return verify_fam_order(order_id)
-    if gw=='paytm': return _verify_paytm_order(order_id)
-    return False,None,None
 
-
+def _verify_active_gateway_order(order_id, gateway=None):
+    details = active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
+    gw = str(gateway or details.get('gateway') or _get_active_payment_gateway()).lower()
+    if gw in PG_API_NAME:
+        return _verify_pg_order(gw, order_id)
+    return False, None, None
 _load_persistent_admin_ids()
 
 
@@ -6981,189 +6826,6 @@ def _build_stylish_qr_image(payload, size=900):
     output.seek(0)
     return output
 
-def _decode_qr_payload_from_url(qr_url):
-    """Recover the gateway QR's exact encoded payload before restyling it.
-
-    OpenCV/numpy are deliberately imported only when a gateway actually returns
-    an image that needs decoding. This keeps every generated child bot much
-    lighter while preserving the exact QR fallback behavior.
-    """
-    if not qr_url or not isinstance(qr_url, str):
-        return None
-
-    try:
-        import cv2
-        import numpy as np
-        if qr_url.startswith("data:image/"):
-            _, encoded = qr_url.split(",", 1)
-            import base64
-            raw = base64.b64decode(encoded)
-            arr = np.frombuffer(raw, dtype=np.uint8)
-        elif qr_url.startswith(("http://", "https://")):
-            res = HTTP_SESSION.get(qr_url, timeout=8)
-            res.raise_for_status()
-            arr = np.frombuffer(res.content, dtype=np.uint8)
-        else:
-            return None
-
-        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if image is None:
-            return None
-
-        detector = cv2.QRCodeDetector()
-        data, _, _ = detector.detectAndDecode(image)
-        data = str(data or "").strip()
-        return data or None
-    except Exception as e:
-        print(f"Gateway QR decode warning: {e}")
-        return None
-
-
-def _extract_gateway_qr_payload(data, qr_url, order_id, amount):
-    """Prefer the gateway's own payload; otherwise decode its QR image."""
-    if isinstance(data, dict):
-        for key in (
-            "upi_uri",
-            "upi_url",
-            "upi",
-            "qr_data",
-            "qr_string",
-            "payment_uri",
-            "payment_url",
-            "deeplink",
-        ):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-    decoded = _decode_qr_payload_from_url(qr_url)
-    if decoded:
-        return decoded
-
-    # Same receiver/order/amount fields as the original fallback QR.
-    return (
-        f"upi://pay?pa={urllib.parse.quote(_fam_upi, safe='@')}"
-        f"&pn={urllib.parse.quote(BOT_BRAND_NAME)}"
-        f"&am={float(amount):.2f}&cu=INR"
-        f"&tn={urllib.parse.quote(str(order_id))}"
-    )
-
-
-def _legacy_create_fam_qr(amount):
-    """Create a FAM order and return a styled QR image + the same order id.
-
-    The gateway still creates the real order and verify_fam_order() still checks
-    that exact order id. Only the visual QR image is changed.
-    """
-    amount = float(amount)
-    _fam_cfg = _gateway_row("fam")
-    _fam_api_key = (_fam_cfg[2] if _fam_cfg and _fam_cfg[2] else (_fam_cfg[3] if _fam_cfg and _fam_cfg[3] else FAM_API_KEY))
-    _fam_upi = (_fam_cfg[1] if _fam_cfg and _fam_cfg[1] else RECEIVER_UPI)
-
-    try:
-        # Official FamGateway v2 uses /api/qr.php. Keep the older
-        # /create_order.php endpoint as a compatibility fallback for an
-        # explicitly configured legacy gateway.
-        create_urls = []
-        for base in _fam_gateway_base_candidates():
-            create_urls.extend(_fam_endpoint_candidates(base, 'qr.php'))
-            create_urls.extend(_fam_endpoint_candidates(base, 'create_order.php'))
-        create_urls = list(dict.fromkeys(create_urls))
-
-        last_error = None
-        for endpoint_url in create_urls:
-            try:
-                res = HTTP_SESSION.get(
-                    endpoint_url,
-                    params={"amount": f"{amount:.2f}", "api_key": _fam_api_key},
-                    timeout=10,
-                )
-                if res.status_code in (401, 403):
-                    raise RuntimeError('FamGateway API token was rejected.')
-                res.raise_for_status()
-                res_json = res.json()
-                data = res_json.get("data") or {}
-
-                if res_json.get("status") == "success" or res_json.get("status") is True:
-                    qr_url = data.get("qr_url") or data.get("qr")
-                    order_id = data.get("order_id")
-
-                    if qr_url and order_id:
-                        payload = _extract_gateway_qr_payload(
-                            data, qr_url, order_id, amount
-                        )
-                        try:
-                            return _build_stylish_qr_image(payload), str(order_id)
-                        except Exception as style_error:
-                            print(f"Styled QR warning: {style_error}")
-
-                        # Absolute final fallback: keep the original gateway QR.
-                        return qr_url, str(order_id)
-                last_error = res_json
-            except Exception as endpoint_error:
-                last_error = endpoint_error
-                continue
-        if last_error:
-            print(f"Gateway QR Error: {last_error}")
-    except Exception as e:
-        print(f"Gateway QR Error: {e}")
-
-    # Original direct-UPI fallback retained for gateway/API outages.
-    order_id = (
-        "FAM"
-        + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        + str(random.randint(1000, 9999))
-    )
-    upi_uri = (
-        f"upi://pay?pa={urllib.parse.quote(_fam_upi, safe='@')}"
-        f"&pn={urllib.parse.quote(BOT_BRAND_NAME)}"
-        f"&am={amount:.2f}&cu=INR&tn={urllib.parse.quote(order_id)}"
-    )
-
-    try:
-        return _build_stylish_qr_image(upi_uri), order_id
-    except Exception as style_error:
-        print(f"Fallback styled QR warning: {style_error}")
-        fallback_qr = (
-            "https://api.qrserver.com/v1/create-qr-code/"
-            f"?size=500x500&data={urllib.parse.quote(upi_uri, safe='')}"
-        )
-        return fallback_qr, order_id
-
-def _legacy_verify_fam_order(order_id):
-    _fam_cfg = _gateway_row("fam")
-    _fam_api_key = (_fam_cfg[2] if _fam_cfg and _fam_cfg[2] else (_fam_cfg[3] if _fam_cfg and _fam_cfg[3] else FAM_API_KEY))
-    if not _fam_api_key or not order_id:
-        return False, None, None
-
-    for base in _fam_gateway_base_candidates():
-        for endpoint in ('verify-order.php', 'verify.php'):
-            for verify_url in _fam_endpoint_candidates(base, endpoint):
-                try:
-                    res = HTTP_SESSION.get(
-                        verify_url,
-                        params={'order_id': str(order_id), 'api_key': _fam_api_key},
-                        timeout=10,
-                    )
-                    if res.status_code in (401, 403):
-                        return False, None, None
-                    res_json = res.json()
-                    if res_json.get('status') == 'success' or res_json.get('status') is True:
-                        data = res_json.get('data') or {}
-                        utr = data.get('utr', 'N/A')
-                        sender = data.get('sender_name', 'UPI User')
-                        return True, utr, sender
-                    # A valid endpoint that says pending/expired is a normal
-                    # negative result; do not jump to a different endpoint and
-                    # accidentally reinterpret it.
-                    if res.status_code in (200, 404, 408) and isinstance(res_json, dict):
-                        status = str(res_json.get('status') or '').lower()
-                        if status in {'pending', 'expired', 'not_found'}:
-                            return False, None, None
-                except Exception:
-                    continue
-    return False, None, None
-
 def _handle_paid_key_delivery_failure(chat_id, user_id, order_id, amount, pay_type, product_name, product_days, reason='API did not return a key'):
     """Notify admins and compensate a verified paid order exactly once."""
     uid = int(user_id); amt = round(float(amount or 0), 2); ptype = str(pay_type or '').lower()
@@ -10841,40 +10503,45 @@ def _admin_category_markup(category):
     return _style_admin_markup(markup)
 
 # ==================== PAYMENT GATEWAY & ADMIN MANAGEMENT ====================
-# FamPay setup uses an explicit per-admin state machine. The old callback tried
-# to reference a missing step_save_fam_upi function, which raised NameError as
-# soon as the UPI ID was submitted. Keeping the setup state in admin_temp_data
-# also prevents Telegram next-step timing from making the panel look frozen.
-_FAMP_SETUP_LOCKS = {}
-_FAMP_SETUP_LOCKS_GUARD = threading.RLock()
+# FamPay and PayTM share ONE setup flow: UPI ID -> API token -> automatic
+# connection check. The state lives in admin_temp_data (per admin) so Telegram
+# next-step timing can never freeze the panel.
+_PG_SETUP_LOCKS = {}
+_PG_SETUP_LOCKS_GUARD = threading.RLock()
 
-def _famp_setup_lock(user_id):
+def _pg_setup_lock(user_id):
     uid = int(user_id)
-    with _FAMP_SETUP_LOCKS_GUARD:
-        return _FAMP_SETUP_LOCKS.setdefault(uid, threading.RLock())
+    with _PG_SETUP_LOCKS_GUARD:
+        return _PG_SETUP_LOCKS.setdefault(uid, threading.RLock())
 
-def _start_famp_setup(chat_id, user_id):
+def _start_pg_setup(chat_id, user_id, gateway):
     if not _is_admin(user_id):
         return
-    with _famp_setup_lock(user_id):
-        admin_temp_data[int(user_id)] = {
-            'famp_setup_stage': 'api_key',
-            'gw_upi': 'ZYVOPAY',
-            'gw_api_key': '',
-        }
+    gateway = str(gateway).lower().strip()
+    if gateway not in PG_API_NAME:
+        return
+    label = PG_LABEL[gateway]
+    with _pg_setup_lock(user_id):
+        admin_temp_data[int(user_id)] = {'pg_setup_stage': 'upi', 'pg_setup_gateway': gateway, 'gw_upi': ''}
     bot.send_message(
         chat_id,
-        '💳 <b>FAMPAY GATEWAY (ZYVO PAY)</b>\n\n🔐 <b>Paste the complete ZYVO PAY API token</b> (the full <code>public.secret</code> value from your ZYVO PAY dashboard).\n\n<i>Only the token is needed. The token is stored privately and the bot verifies the connection automatically. Send /cancel to stop.</i>',
+        f'💳 <b>{label.upper()} GATEWAY</b>\n\n🆔 <b>Enter your {label} UPI ID</b> (example: <code>shop@upi</code>)\n\n<i>Send /cancel to stop.</i>',
         parse_mode='HTML'
     )
+
+def _start_famp_setup(chat_id, user_id):
+    _start_pg_setup(chat_id, user_id, 'fam')
+
+def _start_paytm_setup(chat_id, user_id):
+    _start_pg_setup(chat_id, user_id, 'paytm')
 
 @bot.message_handler(func=lambda message: bool(
     getattr(message, 'from_user', None) and
     _is_admin(message.from_user.id) and
     isinstance(admin_temp_data.get(int(message.from_user.id)), dict) and
-    admin_temp_data.get(int(message.from_user.id), {}).get('famp_setup_stage')
+    admin_temp_data.get(int(message.from_user.id), {}).get('pg_setup_stage')
 ))
-def _handle_famp_setup_message(message):
+def _handle_pg_setup_message(message):
     uid = int(message.from_user.id)
     chat_id = message.chat.id
     text = (message.text or '').strip()
@@ -10887,7 +10554,7 @@ def _handle_famp_setup_message(message):
         except Exception:
             pass
         if command == '/cancel':
-            bot.send_message(chat_id, '✅ <b>FAMP Gateway setup cancelled.</b>', parse_mode='HTML')
+            bot.send_message(chat_id, '✅ <b>Gateway setup cancelled.</b>', parse_mode='HTML')
             try:
                 admin_panel(message)
             except Exception:
@@ -10905,147 +10572,84 @@ def _handle_famp_setup_message(message):
         return
 
     if not text:
-        bot.send_message(chat_id, '❌ Please send the requested FAMP value as text.')
+        bot.send_message(chat_id, '❌ Please send the requested value as text.')
         return
 
-    lock = _famp_setup_lock(uid)
-    with lock:
+    with _pg_setup_lock(uid):
         state = admin_temp_data.get(uid)
         if not isinstance(state, dict):
             return
-        stage = str(state.get('famp_setup_stage') or '')
+        stage = str(state.get('pg_setup_stage') or '')
+        gateway = str(state.get('pg_setup_gateway') or '')
+        if gateway not in PG_API_NAME:
+            admin_temp_data.pop(uid, None)
+            return
+        label = PG_LABEL[gateway]
 
         if stage == 'upi':
-            if '@' not in text or len(text) > 128 or ' ' in text:
-                bot.send_message(chat_id, '❌ Invalid FAMP UPI ID. Send the UPI ID again.')
+            if '@' not in text or len(text) > 128 or re.search(r'\s', text):
+                bot.send_message(chat_id, '❌ Invalid UPI ID. Send it again (example: <code>shop@upi</code>).', parse_mode='HTML')
                 return
             state['gw_upi'] = text
-            state['famp_setup_stage'] = 'api_key'
+            state['pg_setup_stage'] = 'api_key'
             bot.send_message(
                 chat_id,
-                '🔐 <b>Enter FAMP API Token:</b>\n\n<i>After the token is saved, the bot will verify the API connection automatically.</i>',
+                f'🔐 <b>Paste your {label} Gateway API Token</b>\n\n<i>Create it on the gateway website under "API Keys". The token is stored privately and the connection is checked automatically.</i>',
                 parse_mode='HTML'
             )
             return
 
         if stage == 'api_key':
-            if len(text) < 8 or len(text) > 512:
-                bot.send_message(chat_id, '❌ Invalid API token length. Send the real ZYVO PAY API token again.')
-                return
-            try:
-                _zyvopay_signing_key(text)
-            except Exception:
-                bot.send_message(chat_id, '❌ Token format is invalid. Paste the complete <code>public.secret</code> token from ZYVO PAY.', parse_mode='HTML')
+            if len(text) < 8 or len(text) > 512 or re.search(r'\s', text):
+                bot.send_message(chat_id, '❌ Invalid API token. Paste the complete token again.')
                 return
             try:
                 bot.delete_message(chat_id, message.message_id)  # do not leave the secret in chat history
             except Exception:
                 pass
-
-            upi = 'ZYVOPAY'
-            state['gw_api_key'] = text
+            upi = str(state.get('gw_upi') or '')
             try:
-                # Save first so a successful connection check and a process
-                # restart both see exactly the same credentials.
-                _save_gateway('fam', upi, text, text)
+                # Save first so the connection check and a restart see the same credentials.
+                _save_gateway(gateway, upi, PG_KEY_MARKER, text)
                 admin_temp_data.pop(uid, None)
-                bot.send_message(
-                    chat_id,
-                    '⏳ <b>ZYVO PAY API Token Saved.</b>\n\nChecking API connection now...',
-                    parse_mode='HTML'
-                )
+                bot.send_message(chat_id, f'⏳ <b>{label} credentials saved.</b>\n\nChecking connection now...', parse_mode='HTML')
 
-                def _famp_connection_worker():
-                    ok, detail = _check_fam_connection()
+                def _pg_connection_worker():
+                    ok, detail = _check_pg_connection(gateway)
+                    extra = ''
+                    if ok and not _get_active_payment_gateway():
+                        # No gateway is live yet: switch this one ON so it works right away.
+                        try:
+                            if _set_active_payment_gateway(gateway):
+                                extra = f'\n\n🟢 <b>{label} System is now ON.</b>'
+                        except Exception:
+                            pass
+                    elif ok:
+                        extra = f'\n\nTurn <b>{label} System</b> ON from the gateway menu when you want to use it.'
                     try:
                         bot.send_message(
                             chat_id,
-                            ('✅' if ok else '❌') +
-                            f' <b>FAMP Connection {"Successful" if ok else "Failed"}</b>\n\n'
-                            f'<code>{html.escape(str(detail))}</code>',
+                            ('✅' if ok else '❌') + f' <b>{label} Connection {"Successful" if ok else "Failed"}</b>\n\n'
+                            f'<code>{html.escape(str(detail))}</code>' + extra,
                             parse_mode='HTML',
                             reply_markup=_gateway_manager_markup(),
                         )
                     except Exception as exc:
-                        print(f'[FAMP CONNECTION UI ERROR] {exc}')
+                        print(f'[PAYMENT GATEWAY CONNECTION UI ERROR] {exc}')
 
-                _run_user_task_async(_famp_connection_worker)
+                _run_user_task_async(_pg_connection_worker)
             except Exception as exc:
                 admin_temp_data.pop(uid, None)
-                _set_gateway_connected('fam', False)
+                _set_gateway_connected(gateway, False)
                 bot.send_message(
                     chat_id,
-                    f'❌ <b>FAMP save failed.</b>\n\n<code>{html.escape(str(exc)[:700])}</code>',
+                    f'❌ <b>{label} save failed.</b>\n\n<code>{html.escape(str(exc)[:700])}</code>',
                     parse_mode='HTML',
                     reply_markup=_gateway_manager_markup(),
                 )
             return
 
         admin_temp_data.pop(uid, None)
-
-# PayTM setup uses an explicit per-admin state machine instead of depending only
-# on chained next-step handlers. This prevents the exact 'UPI entered -> frozen
-# -> next credential never requested' failure when Telegram/client timing is
-# unusual. Existing step_* functions remain below for backward compatibility.
-_PAYTM_SETUP_LOCKS = {}
-_PAYTM_SETUP_LOCKS_GUARD = threading.RLock()
-
-def _paytm_setup_lock(user_id):
-    uid = int(user_id)
-    with _PAYTM_SETUP_LOCKS_GUARD:
-        return _PAYTM_SETUP_LOCKS.setdefault(uid, threading.RLock())
-
-def _start_paytm_setup(chat_id, user_id):
-    if not _is_admin(user_id): return
-    with _paytm_setup_lock(user_id):
-        admin_temp_data[int(user_id)] = {'paytm_setup_stage':'upi','gw_upi':'','gw_merchant_key':''}
-    bot.send_message(chat_id, '💳 <b>PAYTM / ZYVO PAY GATEWAY</b>\n\nEnter the UPI ID configured in your ZYVO PAY merchant dashboard:', parse_mode='HTML')
-
-@bot.message_handler(func=lambda message: bool(
-    getattr(message, 'from_user', None) and _is_admin(message.from_user.id) and
-    isinstance(admin_temp_data.get(int(message.from_user.id)), dict) and
-    admin_temp_data.get(int(message.from_user.id), {}).get('paytm_setup_stage')
-))
-def _handle_paytm_setup_message(message):
-    uid=int(message.from_user.id); chat_id=message.chat.id; text=(message.text or '').strip()
-    command=text.split()[0].lower() if text else ''
-    if command in {'/cancel','/admin','/start'}:
-        admin_temp_data.pop(uid,None)
-        try: bot.clear_step_handler_by_chat_id(chat_id)
-        except Exception: pass
-        if command=='/cancel': bot.send_message(chat_id,'✅ <b>Gateway setup cancelled.</b>',parse_mode='HTML')
-        elif command=='/admin':
-            try: admin_panel(message)
-            except Exception: pass
-        else:
-            try: send_welcome(message)
-            except Exception: pass
-        return
-    if not text:
-        bot.send_message(chat_id,'❌ Please send text.'); return
-    with _paytm_setup_lock(uid):
-        state=admin_temp_data.get(uid)
-        if not isinstance(state,dict): return
-        stage=state.get('paytm_setup_stage')
-        if stage=='upi':
-            if '@' not in text or len(text)>128:
-                bot.send_message(chat_id,'❌ Invalid UPI ID. Send it again.'); return
-            state['gw_upi']=text; state['paytm_setup_stage']='token'
-            bot.send_message(chat_id,'🔐 <b>Paste the complete ZYVO PAY API token</b> (the full <code>public.secret</code> value from the dashboard).\n\nThe token is stored privately in the bot database and never shown back.',parse_mode='HTML')
-            return
-        if stage=='token':
-            if '.' not in text or len(text)>512 or not all(text.split('.',1)):
-                bot.send_message(chat_id,'❌ Token format is invalid. Paste the complete public.secret token from ZYVO PAY.'); return
-            upi=state.get('gw_upi','')
-            try:
-                # Keep token in the existing encrypted/DB-backed gateway credential field; MID column is not used.
-                _save_gateway('paytm',upi,'ZYVOPAY',text)
-                admin_temp_data.pop(uid,None)
-                bot.send_message(chat_id,'💾 <b>ZYVO PAY credentials saved.</b>\n\nNext, tap <b>Check PayTM Connection</b> to validate the token, then turn the gateway ON. The existing PayTM menu now uses ZYVO PAY API; FamPay remains separate.',parse_mode='HTML',reply_markup=_gateway_manager_markup())
-            except Exception:
-                admin_temp_data.pop(uid,None)
-                bot.send_message(chat_id,'❌ Could not save gateway settings. Please try again.')
-
 
 def _gateway_manager_markup():
     active=_get_active_payment_gateway()
@@ -11070,65 +10674,21 @@ def _gateway_manager_markup():
 
 def _send_gateway_manager(chat_id,message_id=None):
     active=_get_active_payment_gateway(); label={'fam':'FAMPAY','paytm':'PAYTM'}.get(active,'None')
-    text=f"💳 <b>PAYMENT GATEWAYS</b>\n\n⚡ <b>Active Gateway:</b> {label}\nFamPay and PayTM are stored independently. Only the gateway explicitly switched ON is used for new payments.\nFamPay button: paste only the ZYVO PAY API token. PayTM menu is also connected to ZYVO PAY; save UPI ID + API token and verify the connection."
+    text=f"💳 <b>PAYMENT GATEWAYS</b>\n\n⚡ <b>Active Gateway:</b> {label}\nFamPay and PayTM both run through the one unified payment gateway website. For each: tap its button, send the UPI ID, then the API token - the bot checks the connection automatically. Only the gateway switched ON is used for new payments."
     markup=_gateway_manager_markup()
     if message_id:
         try: return bot.edit_message_text(text,chat_id=chat_id,message_id=message_id,parse_mode='HTML',reply_markup=markup)
         except Exception: pass
     return bot.send_message(chat_id,text,parse_mode='HTML',reply_markup=markup)
-def step_save_paytm_upi(message):
-    uid=message.from_user.id
-    if not _is_admin(uid): return
-    upi=(message.text or '').strip()
-    if not upi or '@' not in upi:
-        m=bot.send_message(message.chat.id,'❌ Invalid PayTM UPI ID. Send the UPI ID again.'); bot.register_next_step_handler(m,step_save_paytm_upi); return
-    admin_temp_data.setdefault(uid,{})['gw_upi']=upi
-    m=bot.send_message(message.chat.id,'🆔 <b>Enter PayTM Merchant ID (MID):</b>',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_merchant)
-
-def step_save_paytm_merchant(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    mid=(message.text or '').strip()
-    if not mid or not d.get('gw_upi'):
-        m=bot.send_message(message.chat.id,'❌ Merchant ID cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_merchant); return
-    d['gw_merchant_id']=mid
-    m=bot.send_message(message.chat.id,'🔐 <b>Enter PayTM Merchant Key:</b>',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_merchant_key)
-
-def step_save_paytm_merchant_key(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    key=(message.text or '').strip()
-    if not key or not d.get('gw_upi') or not d.get('gw_merchant_id'):
-        m=bot.send_message(message.chat.id,'❌ Merchant Key cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_merchant_key); return
-    d['gw_merchant_key']=key
-    m=bot.send_message(message.chat.id,'🖥️ <b>Enter PayTM POS ID:</b>\n\nRequired for Dynamic QR.',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_pos_id)
-
-def step_save_paytm_pos_id(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    pos=(message.text or '').strip()
-    if not pos or not d.get('gw_upi') or not d.get('gw_merchant_id') or not d.get('gw_merchant_key'):
-        m=bot.send_message(message.chat.id,'❌ POS ID cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_pos_id); return
-    d['gw_pos_id']=pos
-    m=bot.send_message(message.chat.id,'🧩 <b>Enter PayTM Client ID:</b>\n\nStandard accounts may use <code>C11</code>.',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_client_id)
-
-def step_save_paytm_client_id(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    client=(message.text or '').strip()
-    if client.upper()=='SKIP': client=str(get_setting('paytm_client_id') or PAYTM_DEFAULT_CLIENT_ID).strip() or 'C11'
-    if not client or not d.get('gw_upi') or not d.get('gw_merchant_id') or not d.get('gw_merchant_key') or not d.get('gw_pos_id'):
-        m=bot.send_message(message.chat.id,'❌ Client ID cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_client_id); return
-    _save_gateway('paytm',d['gw_upi'],d['gw_merchant_id'],d['gw_merchant_key'])
-    set_setting('paytm_pos_id',d['gw_pos_id']); set_setting('paytm_client_id',client); admin_temp_data.pop(uid,None)
-    bot.send_message(message.chat.id,'💾 <b>PayTM Gateway Saved.</b>\n\nPayTM remains <b>OFF</b> until you check the connection and explicitly turn it ON.',parse_mode='HTML',reply_markup=_gateway_manager_markup())
-
 def _gateway_toggle(chat_id,gateway):
     gateway=str(gateway).lower().strip(); row=_gateway_row(gateway)
     if not row or not row[1] or not row[2]:
         bot.send_message(chat_id,f'❌ <b>{gateway.upper()} is not configured.</b>',parse_mode='HTML'); return
     if not int(row[4] or 0):
         bot.send_message(chat_id,f'❌ <b>{gateway.upper()} is not connected.</b> Use Check Connection first.',parse_mode='HTML'); return
-    if gateway=='paytm':
-        ready=_paytm_payment_config_error()
-        if ready:
-            bot.send_message(chat_id,'❌ <b>PayTM cannot be turned ON yet.</b>\n\n'+html.escape(ready),parse_mode='HTML'); return
+    ready=_pg_config_error(gateway)
+    if ready:
+        bot.send_message(chat_id,f'❌ <b>{gateway.upper()} cannot be turned ON yet.</b>\n\n'+html.escape(ready),parse_mode='HTML'); return
     if _get_active_payment_gateway()==gateway:
         set_setting('active_payment_gateway',''); bot.send_message(chat_id,f'⚪ <b>{gateway.upper()} System OFF.</b>',parse_mode='HTML')
     else:
@@ -13971,7 +13531,7 @@ def _reseller_discount_start_payment(chat_id,message_id=None):
         return
     user=current_user or get_user(chat_id); name=user[1] if user else 'User'
     active_orders[str(order_ref)]={'user_id':int(chat_id),'amount':float(amount),'gateway':_get_active_payment_gateway(),'purpose':'reseller_activation'}
-    text=_render_reseller_discount_activation_text(name,amount,order_ref)
+    text=_render_reseller_discount_activation_text(name,_pg_pay_amount(order_ref,amount),order_ref)+_pg_amount_note(order_ref,amount)
     markup=types.InlineKeyboardMarkup(); markup.add(make_ui_button('🔙 Back to Main',callback_data='reseller_qr_back',button_key='nav:back_qr',default_color='red',force_style=True))
     if message_id:
         _delete_message_safely(chat_id,message_id)
@@ -15345,7 +14905,7 @@ def show_upi_checkout(chat_id, product_id, message_id=None, device_id=None):
         caption_text = _render_qr_payment_text(
             qr_custom_template,
             prod_name=prod_name, prod_days=prod_days,
-            amount=final_price, order_id=order_ref,
+            amount=_pg_pay_amount(order_ref, final_price), order_id=order_ref,
             purchase_date=purchase_date, device_id=device_id,
         )
     else:
@@ -15353,17 +14913,18 @@ def show_upi_checkout(chat_id, product_id, message_id=None, device_id=None):
             "📦 <b>Order Details:</b>\n"
             f"├── 🎮 <b>Product:</b> {html.escape(str(prod_name), quote=False)}\n"
             f"├── ⏱️ <b>Plan:</b> {html.escape(str(prod_days), quote=False)}\n"
-            f"├── 💰 <b>Amount:</b> ₹{final_price:.2f} INR\n"
+            f"├── 💰 <b>Amount:</b> ₹{_pg_pay_amount(order_ref, final_price):.2f} INR\n"
             f"{dev_info}"
             f"├── 📅 <b>Purchase Date:</b> {html.escape(purchase_date, quote=False)}\n"
             f"└── 🆔 <b>Order ID:</b> <code>{html.escape(str(order_ref), quote=False)}</code>",
             "📱 <b>How to Pay:</b>\n"
             "├── 1️⃣ Scan the QR Code above using GPay, PhonePe or FamPay\n"
-            f"├── 2️⃣ Pay exact amount: <b>₹{final_price:.2f}</b>\n"
+            f"├── 2️⃣ Pay exact amount: <b>₹{_pg_pay_amount(order_ref, final_price):.2f}</b>\n"
             "└── 3️⃣ Wait a few seconds for auto-verification!",
             "────────────────────────\n"
             "⚡ <i>Auto-checking live payment in background...</i>",
         ])
+    caption_text = caption_text + _pg_amount_note(order_ref, final_price)
 
     try:
         btn_back = make_ui_button(
@@ -15860,7 +15421,7 @@ def show_topup_upi_screen(chat_id, amount, message_id=None):
     # Add Balance now uses its own Premium-editable QR design. The live amount
     # and gateway Order ID are injected on every request, exactly like product
     # checkout, so a copied admin sample can never leak an old transaction.
-    caption_text = _render_add_balance_qr_text(amount, order_ref)
+    caption_text = _render_add_balance_qr_text(_pg_pay_amount(order_ref, amount), order_ref) + _pg_amount_note(order_ref, amount)
     markup = types.InlineKeyboardMarkup()
     markup.add(make_ui_button("🔙 Back to Main", callback_data="back_from_qr",
                               button_key="nav:back_qr", default_color="blue"))
