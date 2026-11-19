@@ -1082,7 +1082,7 @@ except Exception:
 guide_video_url = None
 
 # ==================== UNIFIED PAYMENT GATEWAY SETTINGS ====================
-PG_BASE_URL = os.getenv('PAYMENT_GATEWAY_BASE_URL', 'https://paymentgateway-0aak.onrender.com').strip().rstrip('/')
+PG_BASE_URL = os.getenv('PAYMENT_GATEWAY_BASE_URL', 'http://paygatway.shop').strip().rstrip('/')
 PG_KEY_MARKER = 'PGW'  # stored in payment_gateways.merchant_id for gateways saved on the unified system
 
 # ==================== DATABASE SETUP ====================
